@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Prepares a fresh Amp orb (Debian 12) to build and test this repository:
+# Bun dependencies for the CLI/server, desktop UI, IM adapters and Chrome
+# extension, plus the Rust toolchain and Tauri's Linux libraries so
+# desktop/src-tauri can be checked and tested. Idempotent: on a warm
+# snapshot every step is a quick no-op.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+step() {
+  local name="$1"
+  shift
+  local start=$SECONDS
+  echo "==> $name"
+  "$@"
+  echo "<== $name ($((SECONDS - start))s)"
+}
+
+# Tauri's Linux build dependencies, the same list the release workflow
+# installs (.github/workflows/release-desktop.yml), minus what orbs ship.
+apt_packages=(
+  build-essential
+  pkg-config
+  file
+  patchelf
+  libssl-dev
+  libxdo-dev
+  libwebkit2gtk-4.1-dev
+  libayatana-appindicator3-dev
+  librsvg2-dev
+)
+
+install_apt_packages() {
+  local missing=()
+  local pkg
+  for pkg in "${apt_packages[@]}"; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" || missing+=("$pkg")
+  done
+  if ((${#missing[@]} == 0)); then
+    echo "all present"
+    return
+  fi
+  echo "installing: ${missing[*]}"
+  sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
+}
+
+# The repo has no rust-toolchain file; CI uses stable (dtolnay/rust-toolchain@stable).
+install_rust() {
+  if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+      sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+  fi
+  "$HOME/.cargo/bin/rustup" component add rustfmt clippy
+}
+
+# Login shells (Amp, supervised services) get cargo on PATH.
+persist_cargo_path() {
+  local marker="# superai-agent: Rust toolchain"
+  local file
+  for file in "$HOME/.bash_profile" "$HOME/.bashrc"; do
+    if ! grep -Fqx "$marker" "$file" 2>/dev/null; then
+      printf '\n%s\n[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"\n' "$marker" >>"$file"
+    fi
+  done
+}
+
+bun_install() {
+  local dir
+  for dir in . desktop adapters chrome-extension; do
+    echo "-- $dir"
+    (cd "$dir" && bun install --frozen-lockfile)
+  done
+}
+
+# Download crates now so cargo check/test in the orb does not hit the network.
+cargo_fetch() {
+  (cd desktop/src-tauri && "$HOME/.cargo/bin/cargo" fetch --locked)
+}
+
+# tauri-build refuses to compile (even `cargo test`) until the externalBin
+# sidecar exists. `tauri dev` / `tauri build` rebuild it anyway, so only
+# build it when missing.
+build_sidecar() {
+  local triple
+  triple="$("$HOME/.cargo/bin/rustc" -vV | sed -n 's/^host: //p')"
+  if [[ -f "desktop/src-tauri/binaries/superai-agent-sidecar-$triple" ]]; then
+    echo "present"
+    return
+  fi
+  (cd desktop && PATH="$HOME/.cargo/bin:$PATH" bun run build:sidecars)
+}
+
+step "apt packages" install_apt_packages
+step "rust toolchain" install_rust
+step "persist cargo PATH" persist_cargo_path
+step "bun install" bun_install
+step "cargo fetch" cargo_fetch
+step "desktop sidecar" build_sidecar

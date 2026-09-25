@@ -1,6 +1,9 @@
 .env
 .env.*
 !.env.example
+
+# Amp orb portal registrations (generated per orb)
+.amp/portals/*
 node_modules
 .DS_Store
 prd.md
